@@ -49,15 +49,21 @@ def init_db() -> None:
                 trip_id INTEGER NOT NULL REFERENCES trips(id) ON DELETE CASCADE,
                 amount_dest REAL NOT NULL,
                 amount_home REAL NOT NULL,
+                category TEXT DEFAULT 'Прочее',
                 created_at TEXT NOT NULL
             );
             """
         )
-        # миграция старой базы: добавляем страны, если колонок ещё нет
+        # миграция старой базы: добавляем страны и категорию, если колонок ещё нет
         cols = {row["name"] for row in conn.execute("PRAGMA table_info(trips)")}
         if "home_country" not in cols:
             conn.execute("ALTER TABLE trips ADD COLUMN home_country TEXT DEFAULT ''")
             conn.execute("ALTER TABLE trips ADD COLUMN dest_country TEXT DEFAULT ''")
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(expenses)")}
+        if "category" not in cols:
+            conn.execute(
+                "ALTER TABLE expenses ADD COLUMN category TEXT DEFAULT 'Прочее'"
+            )
 
 
 def get_or_create_user(telegram_id: int) -> int:
@@ -168,12 +174,13 @@ def spent_home(trip_id: int) -> float:
         return row["s"]
 
 
-def add_expense(trip_id: int, amount_dest: float, amount_home: float) -> None:
+def add_expense(trip_id: int, amount_dest: float, amount_home: float,
+                category: str = "Прочее") -> None:
     with get_connection() as conn:
         conn.execute(
-            "INSERT INTO expenses (trip_id, amount_dest, amount_home, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (trip_id, amount_dest, amount_home, datetime.now().isoformat()),
+            "INSERT INTO expenses (trip_id, amount_dest, amount_home, category, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (trip_id, amount_dest, amount_home, category, datetime.now().isoformat()),
         )
 
 

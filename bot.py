@@ -21,7 +21,7 @@ from telebot import types
 
 import database as db
 from countries import resolve_country
-from current_api import CurrencyAPIError, convert_currency, get_current_rate
+from current_api import CurrencyAPIError, convert_currency, get_current_rate, get_quota_info
 
 load_dotenv()
 
@@ -46,6 +46,14 @@ def fmt(amount: float) -> str:
 def fmt_rate(rate: float) -> str:
     """Курс валюты: всегда 4 знака после запятой (точность для слабых курсов)."""
     return f"{Decimal(str(rate)).quantize(Decimal('0.0001'), rounding=ROUND_HALF_UP):f}"
+
+
+def quota_text() -> str:
+    """Остаток запросов API за текущий месяц (из заголовков последнего ответа)."""
+    info = get_quota_info()
+    if not info or info.get("limit") is None:
+        return ""
+    return f"⚡ Запросы API ({info['month']}): {info['remaining']} из {info['limit']}"
 
 
 def main_menu() -> types.InlineKeyboardMarkup:
@@ -103,7 +111,35 @@ def balance_text(trip) -> str:
         f"Курс: 1 {trip['home_currency']} = {fmt_rate(trip['rate'])} {trip['dest_currency']}\n\n"
         f"💰 Остаток: {fmt(rest_d)} {trip['dest_currency']} = {fmt(rest_h)} {trip['home_currency']}\n"
         f"Потрачено: {fmt(spent_d)} {trip['dest_currency']} ({fmt(spent_h)} {trip['home_currency']})"
+        + (f"\n\n{quota_text()}" if quota_text() else "")
     )
+
+
+# Категории расходов: (название в БД, эмодзи для кнопки)
+CATEGORIES: list[tuple[str, str]] = [
+    ("Еда", "🍔"),
+    ("Транспорт", "🚕"),
+    ("Жильё", "🏨"),
+    ("Развлечения", "🎉"),
+    ("Прочее", "📦"),
+]
+
+
+def category_emoji(name: str) -> str:
+    """Эмодзи категории по её названию (для истории)."""
+    for cat_name, emoji in CATEGORIES:
+        if cat_name == name:
+            return emoji
+    return "📦"
+
+
+def expense_category_kb() -> types.InlineKeyboardMarkup:
+    """Клавиатура выбора категории расхода (вместо Да/Нет)."""
+    kb = types.InlineKeyboardMarkup()
+    for name, emoji in CATEGORIES:
+        kb.row(types.InlineKeyboardButton(f"{emoji} {name}", callback_data=f"expense:cat:{name}"))
+    kb.row(types.InlineKeyboardButton("❌ Отмена", callback_data="expense:no"))
+    return kb
 
 
 def clear_state(chat_id: int) -> None:
@@ -224,8 +260,10 @@ def show_history(chat_id: int, telegram_id: int) -> None:
     lines = ["📜 История расходов:"]
     for e in reversed(expenses):
         lines.append(
-            f"• {fmt(e['amount_dest'])} {trip['dest_currency']} "
-            f"(= {fmt(e['amount_home'])} {trip['home_currency']}) — {e['created_at'][:16].replace('T', ' ')}"
+            f"• {category_emoji(e['category'] or 'Прочее')} {e['category'] or 'Прочее'}: "
+            f"{fmt(e['amount_dest'])} {trip['dest_currency']} "
+            f"(= {fmt(e['amount_home'])} {trip['home_currency']}) — "
+            f"{e['created_at'][:16].replace('T', ' ')}"
         )
     bot.send_message(chat_id, "\n".join(lines) + f"\n\n{balance_text(trip)}", reply_markup=back_to_menu_kb())
 
@@ -439,16 +477,11 @@ def step_expense(message: types.Message) -> None:
         "state": "expense_confirm",
         "data": {"amount_dest": amount_dest, "amount_home": amount_home},
     }
-    kb = types.InlineKeyboardMarkup()
-    kb.row(
-        types.InlineKeyboardButton("✅ Да, учесть", callback_data="expense:yes"),
-        types.InlineKeyboardButton("❌ Нет", callback_data="expense:no"),
-    )
     bot.send_message(
         message.chat.id,
         f"{fmt(amount_dest)} {trip['dest_currency']} = {fmt(amount_home)} {trip['home_currency']}\n\n"
-        f"Учесть как расход?",
-        reply_markup=kb,
+        f"В какую категорию записать расход?",
+        reply_markup=expense_category_kb(),
     )
 
 
@@ -537,21 +570,26 @@ def cb_expense(call: types.CallbackQuery) -> None:
         clear_state(call.message.chat.id)
         return
     bot.answer_callback_query(call.id)
-    if call.data.endswith("yes"):
-        amount_dest = state["data"]["amount_dest"]
-        amount_home = state["data"]["amount_home"]
-        db.add_expense(trip["id"], amount_dest, amount_home)
-        clear_state(call.message.chat.id)
-        trip = db.get_trip_by_id(trip["id"], user_id)
-        bot.edit_message_text(
-            f"✅ Расход учтён!\n\n{balance_text(trip)}",
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=back_to_menu_kb(),
-        )
-    else:
+    if call.data == "expense:no":
         clear_state(call.message.chat.id)
         bot.edit_message_text("Расход не записан.", call.message.chat.id, call.message.message_id)
+        return
+    # определяем категорию: "expense:cat:<имя>" или старая кнопка "expense:yes"
+    if call.data.startswith("expense:cat:"):
+        category = call.data.split(":", 2)[2]
+    else:
+        category = "Прочее"
+    amount_dest = state["data"]["amount_dest"]
+    amount_home = state["data"]["amount_home"]
+    db.add_expense(trip["id"], amount_dest, amount_home, category)
+    clear_state(call.message.chat.id)
+    trip = db.get_trip_by_id(trip["id"], user_id)
+    bot.edit_message_text(
+        f"✅ Расход учтён: {category_emoji(category)} {category}\n\n{balance_text(trip)}",
+        call.message.chat.id,
+        call.message.message_id,
+        reply_markup=back_to_menu_kb(),
+    )
 
 
 # ---------------------------------------------------------------- fallback

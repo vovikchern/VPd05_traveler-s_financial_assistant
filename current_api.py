@@ -11,6 +11,7 @@ API-ключ берётся из переменных окружения (фай
 """
 import os
 import time
+from datetime import datetime
 
 import requests
 from dotenv import load_dotenv
@@ -22,6 +23,15 @@ API_KEY = os.getenv("CURRENCY_API_KEY", "")
 
 CACHE_TTL = 600  # секунды, 10 минут
 _cache: dict[str, tuple[float, object]] = {}
+
+# Информация о месячной квоте из заголовков последнего ответа API
+# (x-quota-limit / x-quota-remaining)
+quota_info: dict = {"limit": None, "remaining": None, "received": None}
+
+_MONTHS_RU = [
+    "январь", "февраль", "март", "апрель", "май", "июнь",
+    "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь",
+]
 
 
 class CurrencyAPIError(Exception):
@@ -37,6 +47,7 @@ def _api_get(endpoint: str, params: dict) -> dict:
     params["access_key"] = API_KEY
     try:
         response = requests.get(f"{API_URL}/{endpoint}", params=params, timeout=10)
+        _parse_quota_headers(response)
         data = response.json()
     except requests.RequestException as exc:
         raise CurrencyAPIError(f"Ошибка соединения с API: {exc}")
@@ -61,6 +72,41 @@ def _cache_get(key: str):
 
 def _cache_put(key: str, value) -> None:
     _cache[key] = (time.time(), value)
+
+
+def _parse_quota_headers(response: requests.Response) -> None:
+    """Запоминает месячную квоту из заголовков ответа API, если они есть."""
+    headers = response.headers
+    try:
+        limit = int(headers["x-quota-limit"]) if headers.get("x-quota-limit") else None
+        remaining = (
+            int(headers["x-quota-remaining"]) if headers.get("x-quota-remaining") else None
+        )
+    except (TypeError, ValueError):
+        return
+    if limit is not None:
+        quota_info["limit"] = limit
+    if remaining is not None:
+        quota_info["remaining"] = remaining
+    if limit is not None or remaining is not None:
+        quota_info["received"] = time.time()
+
+
+def get_quota_info() -> dict | None:
+    """
+    Возвращает информацию о месячной квоте API:
+    {"limit": 100, "remaining": 89, "month": "октябрь 2026"}.
+    None — если API ещё ни разу не отвечал с заголовками квоты.
+    """
+    if quota_info["limit"] is None and quota_info["remaining"] is None:
+        return None
+    received = quota_info["received"] or time.time()
+    dt = datetime.fromtimestamp(received)
+    return {
+        "limit": quota_info["limit"],
+        "remaining": quota_info["remaining"],
+        "month": f"{_MONTHS_RU[dt.month - 1]} {dt.year}",
+    }
 
 
 def get_current_rate(base: str = "USD", currencies: list[str] | None = None) -> dict[str, float]:
