@@ -246,6 +246,48 @@ def cmd_history(message: types.Message) -> None:
     show_history(message.chat.id, message.from_user.id)
 
 
+def history_summary_view(trip, summary) -> tuple[str, types.InlineKeyboardMarkup]:
+    """Свёрнутая история: статьи расходов с итоговыми суммами."""
+    lines = [f"📜 История расходов — {route_text(trip)}:", ""]
+    kb = types.InlineKeyboardMarkup()
+    for row in summary:
+        category = row["category"] or "Прочее"
+        lines.append(
+            f"{category_emoji(category)} {category}: "
+            f"{fmt(row['total_dest'])} {trip['dest_currency']} "
+            f"(= {fmt(row['total_home'])} {trip['home_currency']}) · {row['cnt']}"
+        )
+        kb.row(
+            types.InlineKeyboardButton(
+                f"{category_emoji(category)} {category} · {fmt(row['total_dest'])} {trip['dest_currency']}",
+                callback_data=f"hist:{trip['id']}:{category}",
+            )
+        )
+    lines += ["", "👆 Нажми на статью, чтобы увидеть покупки"]
+    kb.row(types.InlineKeyboardButton("☰ Меню", callback_data="menu:open"))
+    return "\n".join(lines), kb
+
+
+def history_detail_view(trip, category: str, expenses) -> tuple[str, types.InlineKeyboardMarkup]:
+    """Развёрнутая статья: все покупки по категории."""
+    lines = [
+        f"{category_emoji(category)} {category} — покупки:",
+        "",
+    ]
+    for e in reversed(expenses):
+        lines.append(
+            f"• {fmt(e['amount_dest'])} {trip['dest_currency']} "
+            f"(= {fmt(e['amount_home'])} {trip['home_currency']}) — "
+            f"{e['created_at'][:16].replace('T', ' ')}"
+        )
+    total_dest = sum(e["amount_dest"] for e in expenses)
+    lines += ["", f"Итого: {fmt(total_dest)} {trip['dest_currency']}"]
+    kb = types.InlineKeyboardMarkup()
+    kb.row(types.InlineKeyboardButton("⬅ Назад к статьям", callback_data=f"histback:{trip['id']}"))
+    kb.row(types.InlineKeyboardButton("☰ Меню", callback_data="menu:open"))
+    return "\n".join(lines), kb
+
+
 def show_history(chat_id: int, telegram_id: int) -> None:
     """История расходов активного путешествия (для /history и кнопки меню)."""
     user_id = db.get_or_create_user(telegram_id)
@@ -253,19 +295,12 @@ def show_history(chat_id: int, telegram_id: int) -> None:
     if not trip:
         bot.send_message(chat_id, "🧳 Нет активного путешествия. Создайте: /newtrip")
         return
-    expenses = db.get_expenses(trip["id"])
-    if not expenses:
+    summary = db.get_expense_summary(trip["id"])
+    if not summary:
         bot.send_message(chat_id, "📜 Расходов пока нет. Пришлите число — запишу трату.")
         return
-    lines = ["📜 История расходов:"]
-    for e in reversed(expenses):
-        lines.append(
-            f"• {category_emoji(e['category'] or 'Прочее')} {e['category'] or 'Прочее'}: "
-            f"{fmt(e['amount_dest'])} {trip['dest_currency']} "
-            f"(= {fmt(e['amount_home'])} {trip['home_currency']}) — "
-            f"{e['created_at'][:16].replace('T', ' ')}"
-        )
-    bot.send_message(chat_id, "\n".join(lines) + f"\n\n{balance_text(trip)}", reply_markup=back_to_menu_kb())
+    text, kb = history_summary_view(trip, summary)
+    bot.send_message(chat_id, text, reply_markup=kb)
 
 
 @bot.message_handler(commands=["setrate"])
@@ -590,6 +625,47 @@ def cb_expense(call: types.CallbackQuery) -> None:
         call.message.message_id,
         reply_markup=back_to_menu_kb(),
     )
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("hist:"))
+def cb_history_detail(call: types.CallbackQuery) -> None:
+    """Тап по статье расхода — показать покупки этой статьи."""
+    bot.answer_callback_query(call.id)
+    _, trip_id_s, category = call.data.split(":", 2)
+    user_id = db.get_or_create_user(call.from_user.id)
+    trip = db.get_trip_by_id(int(trip_id_s), user_id)
+    if not trip:
+        return
+    expenses = [
+        e for e in db.get_expenses(trip["id"], limit=200)
+        if (e["category"] or "Прочее") == category
+    ]
+    if not expenses:
+        return
+    text, kb = history_detail_view(trip, category, expenses)
+    try:
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=kb)
+    except Exception:
+        pass  # "message is not modified" и прочие некритичные ошибки Telegram
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("histback:"))
+def cb_history_back(call: types.CallbackQuery) -> None:
+    """Возврат от покупок к списку статей."""
+    bot.answer_callback_query(call.id)
+    trip_id = int(call.data.split(":", 1)[1])
+    user_id = db.get_or_create_user(call.from_user.id)
+    trip = db.get_trip_by_id(trip_id, user_id)
+    if not trip:
+        return
+    summary = db.get_expense_summary(trip["id"])
+    if not summary:
+        return
+    text, kb = history_summary_view(trip, summary)
+    try:
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=kb)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------- fallback

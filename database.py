@@ -193,3 +193,21 @@ def get_expenses(trip_id: int, limit: int = 20) -> list[sqlite3.Row]:
             """,
             (trip_id, limit),
         ).fetchall()
+
+
+def get_expense_summary(trip_id: int) -> list[sqlite3.Row]:
+    """Итоги по статьям расходов: сумма и количество покупок в каждой категории."""
+    with get_connection() as conn:
+        return conn.execute(
+            """
+            SELECT category,
+                   SUM(amount_dest) AS total_dest,
+                   SUM(amount_home) AS total_home,
+                   COUNT(*) AS cnt
+            FROM expenses
+            WHERE trip_id = ?
+            GROUP BY category
+            ORDER BY total_dest DESC
+            """,
+            (trip_id,),
+        ).fetchall()
