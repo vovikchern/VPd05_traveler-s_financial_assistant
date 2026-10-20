@@ -272,10 +272,12 @@ def history_detail_view(trip, category: str, expenses) -> tuple[str, types.Inlin
         "",
     ]
     for e in reversed(expenses):
+        note = (e["note"] or "").strip()
         lines.append(
             f"• {fmt(e['amount_dest'])} {trip['dest_currency']} "
             f"(= {fmt(e['amount_home'])} {trip['home_currency']}) — "
             f"{e['created_at'][:16].replace('T', ' ')}"
+            + (f"\n  📝 {note}" if note else "")
         )
     total_dest = sum(e["amount_dest"] for e in expenses)
     lines += ["", f"Итого: {fmt(total_dest)} {trip['dest_currency']}"]
@@ -484,6 +486,20 @@ def step_setrate(message: types.Message) -> None:
 
 
 @bot.message_handler(
+    func=lambda m: user_states.get(m.chat.id, {}).get("state") == "expense_note",
+    content_types=["text"],
+)
+def step_expense_note(message: types.Message) -> None:
+    """Текст, введённый после выбора категории, = примечание к расходу."""
+    state = user_states[message.chat.id]
+    note = (message.text or "").strip()
+    if len(note) > 100:
+        bot.send_message(message.chat.id, "Примечание слишком длинное (максимум 100 символов). Сократите.")
+        return
+    finish_expense(message.chat.id, message.from_user.id, note)
+
+
+@bot.message_handler(
     func=lambda m: is_number(m.text or ""),
     content_types=["text"],
 )
@@ -520,12 +536,48 @@ def step_expense(message: types.Message) -> None:
     bot.send_message(
         message.chat.id,
         f"{fmt(amount_dest)} {trip['dest_currency']} = {fmt(amount_home)} {trip['home_currency']}\n\n"
-        f"В какую категорию записать расход?",
+        f"В какую категорию записать расход? (после выбора можно добавить примечание)",
         reply_markup=expense_category_kb(),
     )
 
 
 # ---------------------------------------------------------------- handlers: колбэки
+
+
+def finish_expense(chat_id: int, telegram_id: int, note: str) -> None:
+    """Записывает расход из состояния expense_note, подтверждает и показывает баланс."""
+    state = user_states.get(chat_id)
+    if not state or state.get("state") != "expense_note":
+        return
+    category = state["data"]["category"]
+    user_id = db.get_or_create_user(telegram_id)
+    trip = db.get_active_trip(user_id)
+    if not trip:
+        clear_state(chat_id)
+        bot.send_message(chat_id, "⚠ Нет активного путешествия, расход не записан.")
+        return
+    db.add_expense(
+        trip["id"],
+        state["data"]["amount_dest"],
+        state["data"]["amount_home"],
+        category,
+        note,
+    )
+    msg_id = state["data"]["msg_id"]
+    clear_state(chat_id)
+    trip = db.get_trip_by_id(trip["id"], user_id)
+    # Убираем кнопки выбора категории из старого сообщения
+    bot.edit_message_text(
+        f"✅ Расход учтён: {category_emoji(category)} {category}"
+        + (f"\n📝 {note}" if note else ""),
+        chat_id,
+        msg_id,
+    )
+    # Баланс отправляем НОВЫМ сообщением с клавиатурой: reply-клавиатуру нельзя
+    # передать через edit_message_text, а после набора текста клиент сворачивает
+    # меню — новое сообщение с изменённой разметкой его раскрывает
+    bot.send_message(chat_id, balance_text(trip), reply_markup=menu_keyboard())
+
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("switch:"))
 def cb_switch(call: types.CallbackQuery) -> None:
@@ -571,6 +623,12 @@ def cb_rate(call: types.CallbackQuery) -> None:
 @bot.callback_query_handler(func=lambda c: c.data.startswith("expense:"))
 def cb_expense(call: types.CallbackQuery) -> None:
     state = user_states.get(call.message.chat.id)
+    if call.data == "expense:note:skip":
+        # «Без примечания» — записываем расход с пустым примечанием
+        bot.answer_callback_query(call.id)
+        if state and state.get("state") == "expense_note":
+            finish_expense(call.message.chat.id, call.from_user.id, "")
+        return
     if not state or state.get("state") != "expense_confirm":
         bot.answer_callback_query(call.id)
         return
@@ -590,21 +648,20 @@ def cb_expense(call: types.CallbackQuery) -> None:
         category = call.data.split(":", 2)[2]
     else:
         category = "Прочее"
-    amount_dest = state["data"]["amount_dest"]
-    amount_home = state["data"]["amount_home"]
-    db.add_expense(trip["id"], amount_dest, amount_home, category)
-    clear_state(call.message.chat.id)
-    trip = db.get_trip_by_id(trip["id"], user_id)
-    # Убираем кнопки выбора категории из старого сообщения
+    # Категория выбрана: переходим к вводу примечания (необязательного)
+    state["data"]["category"] = category
+    state["data"]["msg_id"] = call.message.message_id
+    state["state"] = "expense_note"
+    kb = types.InlineKeyboardMarkup()
+    kb.row(types.InlineKeyboardButton("⏭ Без примечания", callback_data="expense:note:skip"))
     bot.edit_message_text(
-        f"✅ Расход учтён: {category_emoji(category)} {category}",
+        f"{category_emoji(category)} {category}. Следующим сообщением добавьте "
+        f"примечание к расходу (до 100 символов) — что это было? "
+        f"Например: «ужин в ресторане», «покупка в магазине».",
         call.message.chat.id,
         call.message.message_id,
+        reply_markup=kb,
     )
-    # Баланс отправляем НОВЫМ сообщением с клавиатурой: reply-клавиатуру нельзя
-    # передать через edit_message_text, а после набора суммы клиент сворачивает
-    # меню — новое сообщение с изменённой разметкой его раскрывает
-    bot.send_message(call.message.chat.id, balance_text(trip), reply_markup=menu_keyboard())
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("hist:"))
@@ -646,6 +703,15 @@ def cb_history_back(call: types.CallbackQuery) -> None:
         bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=kb)
     except Exception:
         pass
+
+
+@bot.message_handler(
+    func=lambda m: user_states.get(m.chat.id, {}).get("state") == "expense_confirm",
+    content_types=["text"],
+)
+def step_expense_reminder(message: types.Message) -> None:
+    """Текст до выбора категории — напоминаем порядок, а не «не понял»."""
+    bot.send_message(message.chat.id, "Сначала выберите категорию кнопками выше 👆")
 
 
 # ---------------------------------------------------------------- fallback

@@ -50,6 +50,7 @@ def init_db() -> None:
                 amount_dest REAL NOT NULL,
                 amount_home REAL NOT NULL,
                 category TEXT DEFAULT 'Прочее',
+                note TEXT DEFAULT '',
                 created_at TEXT NOT NULL
             );
             """
@@ -64,6 +65,8 @@ def init_db() -> None:
             conn.execute(
                 "ALTER TABLE expenses ADD COLUMN category TEXT DEFAULT 'Прочее'"
             )
+        if "note" not in cols:
+            conn.execute("ALTER TABLE expenses ADD COLUMN note TEXT DEFAULT ''")
 
 
 def get_or_create_user(telegram_id: int) -> int:
@@ -175,12 +178,12 @@ def spent_home(trip_id: int) -> float:
 
 
 def add_expense(trip_id: int, amount_dest: float, amount_home: float,
-                category: str = "Прочее") -> None:
+                category: str = "Прочее", note: str = "") -> None:
     with get_connection() as conn:
         conn.execute(
-            "INSERT INTO expenses (trip_id, amount_dest, amount_home, category, created_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (trip_id, amount_dest, amount_home, category, datetime.now().isoformat()),
+            "INSERT INTO expenses (trip_id, amount_dest, amount_home, category, note, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (trip_id, amount_dest, amount_home, category, note, datetime.now().isoformat()),
         )
 
 
