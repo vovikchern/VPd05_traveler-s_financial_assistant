@@ -57,7 +57,7 @@ def quota_text() -> str:
     info = get_quota_info()
     if not info or info.get("limit") is None:
         return ""
-    return f"⚡ Запросы API ({info['month']}): {info['remaining']} из {info['limit']}"
+    return f"⚡ Осталось запросов API в {info['month']}: {info['remaining']} из {info['limit']}"
 
 
 # Подписи для постоянной клавиатуры внизу чата
