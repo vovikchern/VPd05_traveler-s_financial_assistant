@@ -26,7 +26,11 @@ from current_api import CurrencyAPIError, convert_currency, get_current_rate, ge
 load_dotenv()
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-bot = telebot.TeleBot(TOKEN)
+# threaded=False: апдейты обрабатываются строго по очереди. Иначе (по умолчанию
+# каждый апдейт в своём потоке) быстрый ввод текста может обогнать колбэк кнопки
+# и «перепрыгнуть» состояние диалога, как число, отправленное сразу после
+# нажатия «Курс подходит».
+bot = telebot.TeleBot(TOKEN, threaded=False)
 
 # Простая машина состояний: {telegram_id: {"state": ..., "data": {...}}}
 user_states: dict[int, dict] = {}
@@ -56,17 +60,6 @@ def quota_text() -> str:
     return f"⚡ Запросы API ({info['month']}): {info['remaining']} из {info['limit']}"
 
 
-def main_menu() -> types.InlineKeyboardMarkup:
-    """Главное inline-меню бота."""
-    kb = types.InlineKeyboardMarkup()
-    kb.row(types.InlineKeyboardButton("🗺 Новое путешествие", callback_data="menu:newtrip"))
-    kb.row(types.InlineKeyboardButton("🧳 Мои путешествия", callback_data="menu:trips"))
-    kb.row(types.InlineKeyboardButton("💰 Баланс", callback_data="menu:balance"))
-    kb.row(types.InlineKeyboardButton("📜 История расходов", callback_data="menu:history"))
-    kb.row(types.InlineKeyboardButton("⚙ Изменить курс", callback_data="menu:setrate"))
-    return kb
-
-
 # Подписи для постоянной клавиатуры внизу чата
 MENU_LABELS = [
     "🗺 Новое путешествие",
@@ -77,19 +70,28 @@ MENU_LABELS = [
 ]
 
 
+_menu_flip = False  # чередование placeholder — см. menu_keyboard()
+
+
 def menu_keyboard() -> types.ReplyKeyboardMarkup:
-    """Постоянная клавиатура внизу чата: меню всегда под рукой."""
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, is_persistent=True)
+    """Постоянная клавиатура внизу чата: меню всегда под рукой.
+
+    Клиент Telegram показывает клавиатуру заново, только когда её разметка
+    изменилась: повторная отправка той же markup свёрнутую клавиатуру
+    НЕ раскрывает. Поэтому каждый вызов чередует input_field_placeholder
+    между двумя вариантами — каждый ответ бота «обновляет» клавиатуру.
+    """
+    global _menu_flip
+    _menu_flip = not _menu_flip
+    placeholder = "Выберите действие…" if _menu_flip else "Выберите пункт меню…"
+    kb = types.ReplyKeyboardMarkup(
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder=placeholder,
+    )
     kb.row("🗺 Новое путешествие", "🧳 Мои путешествия")
     kb.row("💰 Баланс", "📜 История расходов")
     kb.row("⚙ Изменить курс")
-    return kb
-
-
-def back_to_menu_kb() -> types.InlineKeyboardMarkup:
-    """Кнопка «☰ Меню» — прикрепляется к ответам бота."""
-    kb = types.InlineKeyboardMarkup()
-    kb.row(types.InlineKeyboardButton("☰ Меню", callback_data="menu:open"))
     return kb
 
 
@@ -159,15 +161,10 @@ def cmd_start(message: types.Message) -> None:
         "• возьму актуальный курс через API exchangerate.host;\n"
         "• буду конвертировать и учитывать ваши расходы;\n"
         "• покажу остаток сразу в двух валютах.\n\n"
-        "Выберите действие в меню 👇\n"
+        "Выберите действие кнопками меню внизу 👇\n"
         "Команды: /newtrip /switch /balance /history /setrate"
     )
-    bot.send_message(message.chat.id, text, reply_markup=main_menu())
-    bot.send_message(
-        message.chat.id,
-        "💡 А ещё я закрепил кнопки меню внизу чата — они всегда под рукой.",
-        reply_markup=menu_keyboard(),
-    )
+    bot.send_message(message.chat.id, text, reply_markup=menu_keyboard())
 
 
 # Кнопки постоянной клавиатуры = пункты меню.
@@ -198,6 +195,7 @@ def cmd_newtrip(message: types.Message) -> None:
         message.chat.id,
         "🗺 Создаём новое путешествие.\n\n"
         "1/3. Из какой страны выезжаем? (например, Россия)",
+        reply_markup=menu_keyboard(),
     )
 
 
@@ -211,7 +209,7 @@ def show_trips(chat_id: int, telegram_id: int) -> None:
     user_id = db.get_or_create_user(telegram_id)
     trips = db.get_trips(user_id)
     if not trips:
-        bot.send_message(chat_id, "🧳 У вас пока нет путешествий. Создайте: /newtrip")
+        bot.send_message(chat_id, "🧳 У вас пока нет путешествий. Создайте: /newtrip", reply_markup=menu_keyboard())
         return
     kb = types.InlineKeyboardMarkup()
     for t in trips:
@@ -236,9 +234,9 @@ def show_balance(chat_id: int, telegram_id: int) -> None:
     user_id = db.get_or_create_user(telegram_id)
     trip = db.get_active_trip(user_id)
     if not trip:
-        bot.send_message(chat_id, "🧳 Нет активного путешествия. Создайте: /newtrip")
+        bot.send_message(chat_id, "🧳 Нет активного путешествия. Создайте: /newtrip", reply_markup=menu_keyboard())
         return
-    bot.send_message(chat_id, balance_text(trip), reply_markup=back_to_menu_kb())
+    bot.send_message(chat_id, balance_text(trip), reply_markup=menu_keyboard())
 
 
 @bot.message_handler(commands=["history"])
@@ -264,7 +262,6 @@ def history_summary_view(trip, summary) -> tuple[str, types.InlineKeyboardMarkup
             )
         )
     lines += ["", "👆 Нажми на статью, чтобы увидеть покупки"]
-    kb.row(types.InlineKeyboardButton("☰ Меню", callback_data="menu:open"))
     return "\n".join(lines), kb
 
 
@@ -284,7 +281,6 @@ def history_detail_view(trip, category: str, expenses) -> tuple[str, types.Inlin
     lines += ["", f"Итого: {fmt(total_dest)} {trip['dest_currency']}"]
     kb = types.InlineKeyboardMarkup()
     kb.row(types.InlineKeyboardButton("⬅ Назад к статьям", callback_data=f"histback:{trip['id']}"))
-    kb.row(types.InlineKeyboardButton("☰ Меню", callback_data="menu:open"))
     return "\n".join(lines), kb
 
 
@@ -293,11 +289,11 @@ def show_history(chat_id: int, telegram_id: int) -> None:
     user_id = db.get_or_create_user(telegram_id)
     trip = db.get_active_trip(user_id)
     if not trip:
-        bot.send_message(chat_id, "🧳 Нет активного путешествия. Создайте: /newtrip")
+        bot.send_message(chat_id, "🧳 Нет активного путешествия. Создайте: /newtrip", reply_markup=menu_keyboard())
         return
     summary = db.get_expense_summary(trip["id"])
     if not summary:
-        bot.send_message(chat_id, "📜 Расходов пока нет. Пришлите число — запишу трату.")
+        bot.send_message(chat_id, "📜 Расходов пока нет. Пришлите число — запишу трату.", reply_markup=menu_keyboard())
         return
     text, kb = history_summary_view(trip, summary)
     bot.send_message(chat_id, text, reply_markup=kb)
@@ -313,13 +309,14 @@ def setrate_start(chat_id: int, telegram_id: int) -> None:
     user_id = db.get_or_create_user(telegram_id)
     trip = db.get_active_trip(user_id)
     if not trip:
-        bot.send_message(chat_id, "🧳 Нет активного путешествия. Создайте: /newtrip")
+        bot.send_message(chat_id, "🧳 Нет активного путешествия. Создайте: /newtrip", reply_markup=menu_keyboard())
         return
     user_states[chat_id] = {"state": "setrate", "data": {"trip_id": trip["id"]}}
     bot.send_message(
         chat_id,
         f"⚙ Текущий курс: 1 {trip['home_currency']} = {fmt_rate(trip['rate'])} {trip['dest_currency']}\n"
         f"Введите новый курс: сколько {trip['dest_currency']} дают за 1 {trip['home_currency']}?",
+        reply_markup=menu_keyboard(),
     )
 
 
@@ -346,6 +343,7 @@ def ask_rate_confirmation(chat_id: int, home: str, dest: str) -> None:
             chat_id,
             f"⚠ Не удалось получить курс: {exc}\n"
             f"Введите курс вручную: сколько {dest} дают за 1 {home}?",
+            reply_markup=menu_keyboard(),
         )
         return
 
@@ -371,6 +369,7 @@ def step_trip_from(message: types.Message) -> None:
         bot.send_message(
             message.chat.id,
             "🤔 Не знаю такой страны. Попробуйте ещё раз (например: Россия, Китай, Италия).",
+            reply_markup=menu_keyboard(),
         )
         return
     state["data"]["home"] = currency
@@ -379,6 +378,7 @@ def step_trip_from(message: types.Message) -> None:
     bot.send_message(
         message.chat.id,
         f"Валюта отправления: {currency}\n\n2/3. В какую страну едете?",
+        reply_markup=menu_keyboard(),
     )
 
 
@@ -391,12 +391,14 @@ def step_trip_to(message: types.Message) -> None:
         bot.send_message(
             message.chat.id,
             "🤔 Не знаю такой страны. Попробуйте ещё раз (например: Китай, Япония, Турция).",
+            reply_markup=menu_keyboard(),
         )
         return
     if currency == home:
         bot.send_message(
             message.chat.id,
             "Страны совпадают — валютная пара одинаковая. Введите другую страну назначения.",
+            reply_markup=menu_keyboard(),
         )
         return
     state["data"]["dest"] = currency
@@ -408,11 +410,11 @@ def step_trip_to(message: types.Message) -> None:
 def step_manual_rate(message: types.Message) -> None:
     state = user_states[message.chat.id]
     if not is_number(message.text):
-        bot.send_message(message.chat.id, "Введите, пожалуйста, число (например: 104.5)")
+        bot.send_message(message.chat.id, "Введите, пожалуйста, число (например: 104.5)", reply_markup=menu_keyboard())
         return
     rate = to_number(message.text)
     if rate <= 0:
-        bot.send_message(message.chat.id, "Курс должен быть больше нуля. Попробуйте ещё раз.")
+        bot.send_message(message.chat.id, "Курс должен быть больше нуля. Попробуйте ещё раз.", reply_markup=menu_keyboard())
         return
     state["data"]["rate"] = rate
     state["state"] = "trip_amount"
@@ -420,6 +422,7 @@ def step_manual_rate(message: types.Message) -> None:
     bot.send_message(
         message.chat.id,
         f"Курс принят: 1 {home} = {fmt_rate(rate)} {dest}\n\n3/3. Какая стартовая сумма в {home}?",
+        reply_markup=menu_keyboard(),
     )
 
 
@@ -427,11 +430,11 @@ def step_manual_rate(message: types.Message) -> None:
 def step_trip_amount(message: types.Message) -> None:
     state = user_states[message.chat.id]
     if not is_number(message.text):
-        bot.send_message(message.chat.id, "Введите, пожалуйста, число (например: 200000)")
+        bot.send_message(message.chat.id, "Введите, пожалуйста, число (например: 200000)", reply_markup=menu_keyboard())
         return
     amount_home = to_number(message.text)
     if amount_home <= 0:
-        bot.send_message(message.chat.id, "Сумма должна быть больше нуля. Попробуйте ещё раз.")
+        bot.send_message(message.chat.id, "Сумма должна быть больше нуля. Попробуйте ещё раз.", reply_markup=menu_keyboard())
         return
 
     data = state["data"]
@@ -461,22 +464,23 @@ def step_trip_amount(message: types.Message) -> None:
 def step_setrate(message: types.Message) -> None:
     state = user_states[message.chat.id]
     if not is_number(message.text):
-        bot.send_message(message.chat.id, "Введите, пожалуйста, число (например: 0.0108)")
+        bot.send_message(message.chat.id, "Введите, пожалуйста, число (например: 0.0108)", reply_markup=menu_keyboard())
         return
     rate = to_number(message.text)
     if rate <= 0:
-        bot.send_message(message.chat.id, "Курс должен быть больше нуля. Попробуйте ещё раз.")
+        bot.send_message(message.chat.id, "Курс должен быть больше нуля. Попробуйте ещё раз.", reply_markup=menu_keyboard())
         return
     user_id = db.get_or_create_user(message.from_user.id)
     trip = db.get_trip_by_id(state["data"]["trip_id"], user_id)
     if not trip:
         clear_state(message.chat.id)
-        bot.send_message(message.chat.id, "⚠ Путешествие не найдено.")
+        bot.send_message(message.chat.id, "⚠ Путешествие не найдено.", reply_markup=menu_keyboard())
         return
     db.update_trip_rate(trip["id"], rate)
     trip = db.get_trip_by_id(trip["id"], user_id)
     clear_state(message.chat.id)
-    bot.send_message(message.chat.id, f"✅ Курс обновлён.\n\n{balance_text(trip)}", reply_markup=back_to_menu_kb())
+    # Диалог завершён: возвращаем нижнее меню
+    bot.send_message(message.chat.id, f"✅ Курс обновлён.\n\n{balance_text(trip)}", reply_markup=menu_keyboard())
 
 
 @bot.message_handler(
@@ -488,17 +492,18 @@ def step_expense(message: types.Message) -> None:
     user_id = db.get_or_create_user(message.from_user.id)
     trip = db.get_active_trip(user_id)
     if not trip:
-        bot.send_message(message.chat.id, "🧳 Нет активного путешествия. Создайте: /newtrip")
+        bot.send_message(message.chat.id, "🧳 Нет активного путешествия. Создайте: /newtrip", reply_markup=menu_keyboard())
         return
 
     amount_dest = to_number(message.text)
     if amount_dest <= 0:
-        bot.send_message(message.chat.id, "Сумма должна быть больше нуля.")
+        bot.send_message(message.chat.id, "Сумма должна быть больше нуля.", reply_markup=menu_keyboard())
         return
     if amount_dest > trip["initial_dest"] - db.spent_dest(trip["id"]):
         bot.send_message(
             message.chat.id,
             "⚠ Сумма больше остатка баланса. Проверьте число или измените курс (/setrate).",
+            reply_markup=menu_keyboard(),
         )
         return
 
@@ -522,34 +527,6 @@ def step_expense(message: types.Message) -> None:
 
 # ---------------------------------------------------------------- handlers: колбэки
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith("menu:"))
-def cb_menu(call: types.CallbackQuery) -> None:
-    bot.answer_callback_query(call.id)
-    action = call.data.split(":", 1)[1]
-    clear_state(call.message.chat.id)
-    if action == "open":
-        bot.send_message(
-            call.message.chat.id,
-            "☰ Главное меню. Выберите действие:",
-            reply_markup=main_menu(),
-        )
-        return
-    if action == "newtrip":
-        user_states[call.message.chat.id] = {"state": "trip_from", "data": {}}
-        bot.send_message(
-            call.message.chat.id,
-            "🗺 Создаём новое путешествие.\n\n1/3. Из какой страны выезжаем? (например, Россия)",
-        )
-    elif action == "trips":
-        show_trips(call.message.chat.id, call.from_user.id)
-    elif action == "balance":
-        show_balance(call.message.chat.id, call.from_user.id)
-    elif action == "history":
-        show_history(call.message.chat.id, call.from_user.id)
-    elif action == "setrate":
-        setrate_start(call.message.chat.id, call.from_user.id)
-
-
 @bot.callback_query_handler(func=lambda c: c.data.startswith("switch:"))
 def cb_switch(call: types.CallbackQuery) -> None:
     user_id = db.get_or_create_user(call.from_user.id)
@@ -561,7 +538,6 @@ def cb_switch(call: types.CallbackQuery) -> None:
             f"✅ Активное путешествие изменено.\n\n{balance_text(trip)}",
             call.message.chat.id,
             call.message.message_id,
-            reply_markup=back_to_menu_kb(),
         )
     else:
         bot.answer_callback_query(call.id, "⚠ Не удалось переключиться")
@@ -619,12 +595,16 @@ def cb_expense(call: types.CallbackQuery) -> None:
     db.add_expense(trip["id"], amount_dest, amount_home, category)
     clear_state(call.message.chat.id)
     trip = db.get_trip_by_id(trip["id"], user_id)
+    # Убираем кнопки выбора категории из старого сообщения
     bot.edit_message_text(
-        f"✅ Расход учтён: {category_emoji(category)} {category}\n\n{balance_text(trip)}",
+        f"✅ Расход учтён: {category_emoji(category)} {category}",
         call.message.chat.id,
         call.message.message_id,
-        reply_markup=back_to_menu_kb(),
     )
+    # Баланс отправляем НОВЫМ сообщением с клавиатурой: reply-клавиатуру нельзя
+    # передать через edit_message_text, а после набора суммы клиент сворачивает
+    # меню — новое сообщение с изменённой разметкой его раскрывает
+    bot.send_message(call.message.chat.id, balance_text(trip), reply_markup=menu_keyboard())
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("hist:"))
