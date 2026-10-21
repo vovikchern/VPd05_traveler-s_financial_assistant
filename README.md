@@ -75,7 +75,7 @@ Telegram-бот для планирования бюджета поездки: �
 ### 1. Клонировать репозиторий
 
 ```bash
-git clone https://github.com/vovikchern/VPd05_traveler-s_financial_assistant.git
+git clone https://github.com/vovikchern/currency-travel-bot.git
 cd VPd05_traveler-s_financial_assistant
 ```
 
